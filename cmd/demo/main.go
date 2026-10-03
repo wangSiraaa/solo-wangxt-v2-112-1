@@ -8,7 +8,12 @@
 //  5. commit interruption losing a blob -> failed snapshot with the exact
 //     missing chunk located,
 //  6. symlink escaping the root -> restored link is blocked,
-//  7. server restart with a pending snapshot -> startup recovery commits it.
+//  7. server restart with a pending snapshot -> startup recovery commits it,
+//  8. retention rule + GC: reclaim the older of two chunk-sharing snapshots,
+//  9. protect flag: skipped by preview and execution until unprotected,
+//  10. GC interrupted between phases -> restart resumes the same job,
+//  11. GC concurrent with a new snapshot; pending/failed snapshots and their
+//      diagnostics are never collected.
 package main
 
 import (
@@ -284,6 +289,9 @@ func main() {
 	}
 	srv.Close()
 
+	// Retention & GC act, in a fresh repository with its own server.
+	gcAct(work)
+
 	fmt.Println()
 	if fail == 0 {
 		fmt.Printf("✅ 全部 %d 项检查通过\n", pass)
@@ -306,6 +314,11 @@ func startServer(repoDir string) *httptest.Server {
 	if recovered, err := engine.RecoverPending(); err == nil {
 		for _, r := range recovered {
 			fmt.Printf("  [启动恢复] 快照 %d -> %s\n", r.SnapshotID, r.Status)
+		}
+	}
+	if resumed, err := engine.ResumeGCJobs(); err == nil {
+		for _, id := range resumed {
+			fmt.Printf("  [启动恢复] 回收作业 %d 续跑完成\n", id)
 		}
 	}
 	return httptest.NewServer((&api.Server{Engine: engine}).NewRouter())
@@ -393,4 +406,240 @@ func must(err error) {
 		_ = ee
 		os.Exit(2)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Retention & garbage collection act (fresh repository)
+// ---------------------------------------------------------------------------
+
+// bigVersion returns a ~192KiB file body whose content-defined chunks are all
+// identical across versions except one 8-byte patch in the middle: every
+// version shares the same base chunks and adds exactly one new middle chunk.
+func bigVersion(v int) []byte {
+	big := []byte(strings.Repeat("0123456789ABCDEF\n", 12000))
+	copy(big[90*1024:], []byte(fmt.Sprintf("V%06d!", v)))
+	return big
+}
+
+func countBlobs(chunksDir string) int {
+	n := 0
+	err := filepath.WalkDir(chunksDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() && !strings.HasPrefix(d.Name(), ".tmp-") {
+			n++
+		}
+		return nil
+	})
+	must(err)
+	return n
+}
+
+func snapID(body map[string]any) int64 { return int64(body["snapshot_id"].(float64)) }
+
+func jobTargets(body map[string]any) []int64 {
+	var ids []int64
+	if ts, ok := body["targets"].([]any); ok {
+		for _, t := range ts {
+			ids = append(ids, int64(t.(map[string]any)["snapshot_id"].(float64)))
+		}
+	}
+	return ids
+}
+
+func restoreAndVerify(srvURL string, id int64, target string, want []byte) bool {
+	code, body := raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", srvURL, id),
+		map[string]any{"target": target})
+	if code != http.StatusCreated {
+		fmt.Printf("  恢复快照 %d 失败: HTTP %d %v\n", id, code, body["message"])
+		return false
+	}
+	for _, v := range body["verified"].([]any) {
+		m := v.(map[string]any)
+		if m["rel_path"] == "big.bin" {
+			sum := sha256.Sum256(want)
+			return int64(m["size"].(float64)) == int64(len(want)) &&
+				m["digest"] == hex.EncodeToString(sum[:])
+		}
+	}
+	return false
+}
+
+func gcAct(work string) {
+	repoDir := filepath.Join(work, "repo-gc")
+	src := filepath.Join(work, "src2")
+	must(os.MkdirAll(src, 0o755))
+	chunksDir := filepath.Join(repoDir, "chunks")
+	bigFile := filepath.Join(src, "big.bin")
+	writeV := func(v int) []byte {
+		b := bigVersion(v)
+		must(os.WriteFile(bigFile, b, 0o644))
+		return b
+	}
+	srv := startServer(repoDir)
+	fmt.Printf("\n── 保留与回收（独立仓库 %s） ──────────────────────────────\n", repoDir)
+
+	// ---- 8. reclaim the older of two chunk-sharing snapshots ---------------
+	section(8, "保留规则 + 回收：两个共享内容块的快照，回收较旧者，共享块不受影响")
+	writeV(1)
+	snapA := snapID(post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "gc v1"}))
+	v2 := writeV(2)
+	snapB := snapID(post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "gc v2"}))
+	fmt.Printf("  快照 %d (v1) 与 %d (v2) 共享除 1 个块外的全部内容块\n", snapA, snapB)
+
+	code, rule := raw("PUT", srv.URL+"/v1/retention/rules",
+		map[string]any{"name": "default", "keep_last": 1, "keep_days": 0})
+	check("保留规则已存入 SQLite (keep_last=1, version=1)",
+		code == http.StatusCreated && rule["version"].(float64) == 1)
+
+	prev := post(srv.URL+"/v1/gc/preview", map[string]any{"rule": "default"})
+	pt := jobTargets(prev)
+	check("预览：目标只有较旧的快照 A", len(pt) == 1 && pt[0] == snapA)
+	check("预览：A 的候选块中仅 1 个不被共享（可回收）",
+		prev["reclaimable_blobs"].(float64) == 1)
+
+	blobsBefore := countBlobs(chunksDir)
+	job := post(srv.URL+"/v1/gc/jobs", map[string]any{"rule": "default", "wait": true})
+	fmt.Printf("  作业 %v: status=%s 删除快照=%v 删除块=%v 释放=%v 字节\n",
+		job["id"], job["status"], job["snapshots_done"], job["blobs_deleted"], job["bytes_freed"])
+	check("作业完成且只删除 1 个无引用块",
+		job["status"] == "completed" && job["blobs_deleted"].(float64) == 1)
+	check("磁盘 blob 数恰好减 1（共享块保留）", countBlobs(chunksDir) == blobsBefore-1)
+	code, _ = raw("GET", fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapA), nil)
+	check("被回收快照的清单引用已删除 (404)", code == http.StatusNotFound)
+	check("较新快照 B 仍可完整恢复（共享块内容逐字节一致）",
+		restoreAndVerify(srv.URL, snapB, filepath.Join(work, "gc-restore-b"), v2))
+
+	// ---- 9. protect flag ----------------------------------------------------
+	section(9, "保全标记：被保全的目标在预览与执行中都被跳过，解除后才可回收")
+	writeV(3)
+	snapC := snapID(post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "gc v3"}))
+	code, _ = raw("PUT", fmt.Sprintf("%s/v1/snapshots/%d/protect", srv.URL, snapB),
+		map[string]any{"reason": "审计留存"})
+	check("对 B 设置保全标记", code == http.StatusOK)
+
+	prev = post(srv.URL+"/v1/gc/preview", map[string]any{"rule": "default"})
+	skipped, _ := prev["skipped_protected"].([]any)
+	check("预览：B 出现在 skipped_protected，目标集为空",
+		len(jobTargets(prev)) == 0 && len(skipped) == 1 &&
+			int64(skipped[0].(map[string]any)["snapshot_id"].(float64)) == snapB)
+	job = post(srv.URL+"/v1/gc/jobs", map[string]any{"rule": "default", "wait": true})
+	check("执行：被保全的 B 不在冻结目标集中，作业空跑完成",
+		job["status"] == "completed" && job["snapshots_total"].(float64) == 0)
+	si := get(fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapB))
+	check("B 仍是 committed 且标记 protected=true",
+		si["status"] == "committed" && si["protected"] == true)
+
+	code, _ = raw("DELETE", fmt.Sprintf("%s/v1/snapshots/%d/protect", srv.URL, snapB), nil)
+	check("解除 B 的保全", code == http.StatusOK)
+	prev = post(srv.URL+"/v1/gc/preview", map[string]any{"rule": "default"})
+	check("解除后预览：B 成为目标", len(jobTargets(prev)) == 1 && jobTargets(prev)[0] == snapB)
+	job = post(srv.URL+"/v1/gc/jobs", map[string]any{"rule": "default", "wait": true})
+	check("解除后执行：B 被回收", job["snapshots_done"].(float64) == 1)
+	code, _ = raw("GET", fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapB), nil)
+	check("B 的清单引用已删除 (404)", code == http.StatusNotFound)
+	check("最新快照 C 不受影响可完整恢复",
+		restoreAndVerify(srv.URL, snapC, filepath.Join(work, "gc-restore-c"), bigVersion(3)))
+
+	// ---- 10. interrupt between phases, restart resumes the same job ---------
+	section(10, "两阶段中断：引用已删、blob 未清时重启，同一作业续跑且不重复记账")
+	writeV(4)
+	snapD := snapID(post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "gc v4"}))
+	blobsBefore = countBlobs(chunksDir)
+	code, job = raw("POST", srv.URL+"/v1/gc/jobs",
+		map[string]any{"rule": "default", "wait": true, "stop_after_refs": true})
+	jobID := int64(job["id"].(float64))
+	fmt.Printf("  故障时刻: 作业 %d status=%s（C 的引用已删，blob 尚未清理）\n", jobID, job["status"])
+	check("作业停在 refs_deleted（阶段 1 完成、阶段 2 未开始）",
+		code == http.StatusCreated && job["status"] == "refs_deleted")
+	code, _ = raw("GET", fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapC), nil)
+	check("C 的清单引用已删除 (404)", code == http.StatusNotFound)
+	check("blob 一个都没删（磁盘数量不变）", countBlobs(chunksDir) == blobsBefore)
+	srv.Close()
+
+	srv = startServer(repoDir) // restart: startup resume finishes the job
+	job = get(fmt.Sprintf("%s/v1/gc/jobs/%d", srv.URL, jobID))
+	check("重启后续跑的是同一作业并最终 completed",
+		job["status"] == "completed" && int64(job["id"].(float64)) == jobID)
+	check("只清理了无引用的 1 个块", job["blobs_deleted"].(float64) == 1 &&
+		countBlobs(chunksDir) == blobsBefore-1)
+	check("快照 D 完整恢复（共享块未被误删）",
+		restoreAndVerify(srv.URL, snapD, filepath.Join(work, "gc-restore-d"), bigVersion(4)))
+	freed := job["bytes_freed"].(float64)
+	job2 := post(fmt.Sprintf("%s/v1/gc/jobs/%d/resume", srv.URL, jobID), nil)
+	check("重复 resume 已完成作业：计数不变（不重复记账、不重跑）",
+		job2["blobs_deleted"].(float64) == 1 && job2["bytes_freed"].(float64) == freed)
+
+	events := get(fmt.Sprintf("%s/v1/gc/jobs/%d/events", srv.URL, jobID))["events"].([]any)
+	actions := map[string]int{}
+	for _, ev := range events {
+		actions[ev.(map[string]any)["action"].(string)]++
+	}
+	check("审计轨迹完整：job_created/refs_deleted/job_resumed/blob_deleted/job_completed",
+		actions["job_created"] == 1 && actions["snapshot_refs_deleted"] == 1 &&
+			actions["job_resumed"] == 1 && actions["blob_deleted"] == 1 &&
+			actions["job_completed"] == 1)
+	for _, ev := range events {
+		e := ev.(map[string]any)
+		fmt.Printf("    审计: %-22s %s\n", e["action"], e["detail"])
+	}
+
+	// ---- 11. concurrency + pending/failed protection ------------------------
+	section(11, "并发与保护：回收不碰新快照的引用块，pending/failed 及诊断永不自动清除")
+	writeV(5)
+	snapE := snapID(post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "gc v5"}))
+	snapP := snapID(post(srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "gc pending", "finish": false}))
+	writeV(6)
+	code, body := raw("POST", srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "gc doomed", "lose_chunks": 1})
+	snapF := snapID(body)
+	check("构造出 failed 快照（带缺块诊断）", code == http.StatusConflict)
+	v7 := writeV(7)
+
+	// Async GC job racing a brand-new snapshot.
+	code, job = raw("POST", srv.URL+"/v1/gc/jobs", map[string]any{"rule": "default"})
+	gcJobID := int64(job["id"].(float64))
+	snapQ := snapID(post(srv.URL+"/v1/snapshots",
+		map[string]any{"root": src, "message": "gc concurrent", "finish": false}))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		job = get(fmt.Sprintf("%s/v1/gc/jobs/%d", srv.URL, gcJobID))
+		if job["status"] == "completed" || job["status"] == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	check("并发作业完成，目标只有 D（pending/failed 快照从不入选）",
+		job["status"] == "completed" && len(jobTargets(job)) == 1 && jobTargets(job)[0] == snapD)
+
+	si = get(fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapP))
+	check("pending 快照原样保留", si["status"] == "pending")
+	si = get(fmt.Sprintf("%s/v1/snapshots/%d", srv.URL, snapF))
+	errs, _ := get(fmt.Sprintf("%s/v1/snapshots/%d/errors", srv.URL, snapF))["errors"].([]any)
+	missing, _ := get(fmt.Sprintf("%s/v1/snapshots/%d/missing", srv.URL, snapF))["missing"].([]any)
+	check("failed 快照保留且 /errors、/missing 诊断仍可查询",
+		si["status"] == "failed" && len(errs) > 0 && len(missing) == 1)
+
+	vres := post(fmt.Sprintf("%s/v1/snapshots/%d/verify", srv.URL, snapQ), nil)
+	check("并发创建的新快照 Q 的引用块一个不少（验证后 committed）",
+		vres["status"] == "committed")
+	check("Q 可完整恢复", restoreAndVerify(srv.URL, snapQ, filepath.Join(work, "gc-restore-q"), v7))
+	check("保留的最新快照 E 可完整恢复",
+		restoreAndVerify(srv.URL, snapE, filepath.Join(work, "gc-restore-e"), bigVersion(5)))
+
+	// audit overview
+	section(0, "回收作业总览（GET /v1/gc/jobs）")
+	jobs := get(srv.URL + "/v1/gc/jobs")["jobs"].([]any)
+	for _, j := range jobs {
+		m := j.(map[string]any)
+		fmt.Printf("  作业 #%-3v %-12s 目标=%-2v 删块=%-2v 释放=%-7v 规则=%v\n",
+			m["id"], m["status"], m["snapshots_done"], m["blobs_deleted"], m["bytes_freed"],
+			m["rule"])
+	}
+	srv.Close()
 }

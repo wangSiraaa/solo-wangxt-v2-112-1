@@ -56,6 +56,17 @@ func main() {
 		}
 	}
 
+	// A crash can also interrupt a GC job between its two phases (snapshot
+	// references deleted, blobs not yet swept). Resume those jobs against
+	// their frozen target sets; completed jobs are never re-executed.
+	if resumed, err := engine.ResumeGCJobs(); err != nil {
+		log.Printf("startup gc resume: %v", err)
+	} else {
+		for _, id := range resumed {
+			log.Printf("startup gc resume: job %d finished", id)
+		}
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)

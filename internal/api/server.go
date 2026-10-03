@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +32,17 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("PUT /v1/snapshots/{id}/protect", s.protect)
+	mux.HandleFunc("DELETE /v1/snapshots/{id}/protect", s.unprotect)
+	mux.HandleFunc("PUT /v1/retention/rules", s.putRule)
+	mux.HandleFunc("GET /v1/retention/rules", s.listRules)
+	mux.HandleFunc("GET /v1/retention/rules/{name}", s.getRule)
+	mux.HandleFunc("POST /v1/gc/preview", s.gcPreview)
+	mux.HandleFunc("POST /v1/gc/jobs", s.gcExecute)
+	mux.HandleFunc("GET /v1/gc/jobs", s.gcListJobs)
+	mux.HandleFunc("GET /v1/gc/jobs/{id}", s.gcGetJob)
+	mux.HandleFunc("POST /v1/gc/jobs/{id}/resume", s.gcResume)
+	mux.HandleFunc("GET /v1/gc/jobs/{id}/events", s.gcEvents)
 	return mux
 }
 
@@ -55,18 +67,20 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type snapshotResp struct {
-	ID          int64      `json:"id"`
-	RootPath    string     `json:"root_path"`
-	Status      string     `json:"status"`
-	FileCount   int64      `json:"file_count"`
-	DirCount    int64      `json:"dir_count"`
-	BytesTotal  int64      `json:"bytes_total"`
-	ChunksNew   int64      `json:"chunks_new"`
-	ChunksRef   int64      `json:"chunks_referenced"`
-	Polynomial  string     `json:"polynomial"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CommittedAt *time.Time `json:"committed_at,omitempty"`
-	Message     string     `json:"message"`
+	ID            int64      `json:"id"`
+	RootPath      string     `json:"root_path"`
+	Status        string     `json:"status"`
+	FileCount     int64      `json:"file_count"`
+	DirCount      int64      `json:"dir_count"`
+	BytesTotal    int64      `json:"bytes_total"`
+	ChunksNew     int64      `json:"chunks_new"`
+	ChunksRef     int64      `json:"chunks_referenced"`
+	Polynomial    string     `json:"polynomial"`
+	CreatedAt     time.Time  `json:"created_at"`
+	CommittedAt   *time.Time `json:"committed_at,omitempty"`
+	Message       string     `json:"message"`
+	Protected     bool       `json:"protected"`
+	ProtectReason string     `json:"protect_reason,omitempty"`
 }
 
 func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
@@ -92,9 +106,18 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
+	protected, err := s.Engine.Manifest.ProtectedIDs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
 	out := make([]snapshotResp, 0, len(all))
 	for _, si := range all {
-		out = append(out, toSnapshotResp(si))
+		sr := toSnapshotResp(si)
+		if reason, ok := protected[si.ID]; ok {
+			sr.Protected, sr.ProtectReason = true, reason
+		}
+		out = append(out, sr)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
 }
@@ -109,11 +132,9 @@ type createReq struct {
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req createReq
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
-			return
-		}
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+		return
 	}
 	if strings.TrimSpace(req.Root) == "" {
 		writeErr(w, http.StatusBadRequest, "bad_request", "root is required", nil)
@@ -162,10 +183,23 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 func parseID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_id", "snapshot id must be an integer", nil)
+		writeErr(w, http.StatusBadRequest, "bad_id", "id must be an integer", nil)
 		return 0, false
 	}
 	return id, true
+}
+
+// decodeBody parses an optional JSON request body; an empty body is not an
+// error and leaves req untouched.
+func decodeBody(r *http.Request, req any) error {
+	if r.Body == nil {
+		return nil
+	}
+	err := json.NewDecoder(r.Body).Decode(req)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +216,11 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, toSnapshotResp(si))
+	sr := toSnapshotResp(si)
+	if reason, ok, perr := s.Engine.Manifest.Protection(id); perr == nil && ok {
+		sr.Protected, sr.ProtectReason = true, reason
+	}
+	writeJSON(w, http.StatusOK, sr)
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
@@ -347,4 +385,359 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, map[string]any{"snapshot_id": r.SnapshotID, "status": r.Status})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"recovered": ids})
+}
+
+// ---------------------------------------------------------------------------
+// Protect flags
+// ---------------------------------------------------------------------------
+
+type protectReq struct {
+	Reason string `json:"reason"`
+}
+
+func (s *Server) protect(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req protectReq
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+		return
+	}
+	if err := s.Engine.Manifest.ProtectSnapshot(id, req.Reason); err != nil {
+		if errors.Is(err, repo.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "snapshot does not exist", nil)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"snapshot_id": id, "protected": true, "reason": req.Reason,
+	})
+}
+
+func (s *Server) unprotect(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Engine.Manifest.UnprotectSnapshot(id); err != nil {
+		if errors.Is(err, repo.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "snapshot does not exist", nil)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshot_id": id, "protected": false})
+}
+
+// ---------------------------------------------------------------------------
+// Retention rules
+// ---------------------------------------------------------------------------
+
+type ruleReq struct {
+	Name     string `json:"name"`
+	KeepLast int    `json:"keep_last"`
+	KeepDays int    `json:"keep_days"`
+}
+
+type ruleResp struct {
+	Name     string    `json:"name"`
+	Version  int64     `json:"version"`
+	KeepLast int       `json:"keep_last"`
+	KeepDays int       `json:"keep_days"`
+	Created  time.Time `json:"created_at"`
+}
+
+func toRuleResp(r repo.RetentionRule) ruleResp {
+	return ruleResp{Name: r.Name, Version: r.Version, KeepLast: r.KeepLast,
+		KeepDays: r.KeepDays, Created: r.CreatedAt}
+}
+
+func validRuleParams(keepLast, keepDays int) string {
+	if keepLast < 0 || keepDays < 0 {
+		return "keep_last and keep_days must be >= 0"
+	}
+	if keepLast == 0 && keepDays == 0 {
+		return "rule keeps nothing: keep_last or keep_days must be > 0"
+	}
+	return ""
+}
+
+func (s *Server) putRule(w http.ResponseWriter, r *http.Request) {
+	var req ruleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "name is required", nil)
+		return
+	}
+	if msg := validRuleParams(req.KeepLast, req.KeepDays); msg != "" {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_rule", msg, nil)
+		return
+	}
+	rule, err := s.Engine.Manifest.PutRetentionRule(req.Name, req.KeepLast, req.KeepDays)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toRuleResp(*rule))
+}
+
+func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
+	rules, err := s.Engine.Manifest.ListRetentionRules()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]ruleResp, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, toRuleResp(rule))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rules": out})
+}
+
+func (s *Server) getRule(w http.ResponseWriter, r *http.Request) {
+	rule, err := s.Engine.Manifest.GetRetentionRule(r.PathValue("name"))
+	if errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "retention rule does not exist", nil)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, toRuleResp(*rule))
+}
+
+// ---------------------------------------------------------------------------
+// Garbage collection: preview, execute, progress, audit
+// ---------------------------------------------------------------------------
+
+type gcSelectorReq struct {
+	Rule     string `json:"rule"`      // name of a stored rule
+	KeepLast int    `json:"keep_last"` // inline rule when rule is empty
+	KeepDays int    `json:"keep_days"`
+}
+
+func (req gcSelectorReq) selector() backup.GCSelector {
+	return backup.GCSelector{RuleName: req.Rule, KeepLast: req.KeepLast, KeepDays: req.KeepDays}
+}
+
+func writeGCErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", err.Error(), nil)
+		return
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "keep_last") || strings.Contains(msg, "keeps nothing") {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_rule", msg, nil)
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, "gc_failed", msg, nil)
+}
+
+func (s *Server) gcPreview(w http.ResponseWriter, r *http.Request) {
+	var req gcSelectorReq
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+		return
+	}
+	p, err := s.Engine.PreviewGC(req.selector())
+	if err != nil {
+		writeGCErr(w, err)
+		return
+	}
+	targets := make([]map[string]any, 0, len(p.Targets))
+	for _, t := range p.Targets {
+		targets = append(targets, map[string]any{
+			"snapshot_id": t.SnapshotID, "root_path": t.RootPath,
+			"bytes_total": t.BytesTotal, "chunks_referenced": t.ChunksRef,
+			"committed_at": t.CommittedAt,
+		})
+	}
+	skipped := make([]map[string]any, 0, len(p.SkippedProtected))
+	for _, sp := range p.SkippedProtected {
+		skipped = append(skipped, map[string]any{"snapshot_id": sp.SnapshotID, "reason": sp.Reason})
+	}
+	notCommitted := make([]map[string]any, 0, len(p.NotCommitted))
+	for _, nc := range p.NotCommitted {
+		notCommitted = append(notCommitted, map[string]any{"snapshot_id": nc.SnapshotID, "status": nc.Status})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rule":                  toRuleResp(p.Rule),
+		"targets":               targets,
+		"skipped_protected":     skipped,
+		"kept_by_rule":          p.KeptByRule,
+		"skipped_not_committed": notCommitted,
+		"candidate_blobs":       p.CandidateBlobs,
+		"candidate_bytes":       p.CandidateBytes,
+		"reclaimable_blobs":     p.ReclaimableBlobs,
+		"reclaimable_bytes":     p.ReclaimableBytes,
+	})
+}
+
+type gcExecuteReq struct {
+	gcSelectorReq
+	Wait          bool `json:"wait"`            // run synchronously and return the final state
+	StopAfterRefs bool `json:"stop_after_refs"` // failpoint: halt between phase 1 and 2
+}
+
+func (s *Server) gcExecute(w http.ResponseWriter, r *http.Request) {
+	var req gcExecuteReq
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+		return
+	}
+	// The job (rule version + target set + candidate chunks) is frozen before
+	// anything runs; execution is a separate, resumable step.
+	jobID, err := s.Engine.CreateGCJob(req.selector())
+	if err != nil {
+		writeGCErr(w, err)
+		return
+	}
+	if !req.Wait {
+		go func() { _, _ = s.Engine.RunGCJob(jobID, req.StopAfterRefs) }()
+	} else if _, err := s.Engine.RunGCJob(jobID, req.StopAfterRefs); err != nil {
+		writeErr(w, http.StatusInternalServerError, "gc_failed",
+			err.Error(), map[string]any{"job_id": jobID})
+		return
+	}
+	s.writeJob(w, r, http.StatusCreated, jobID)
+}
+
+func (s *Server) gcListJobs(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.Engine.Manifest.ListGCJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]map[string]any, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, gcJobJSON(j, nil, nil))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
+}
+
+func (s *Server) gcGetJob(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	s.writeJob(w, r, http.StatusOK, id)
+}
+
+func (s *Server) gcResume(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	// Idempotent: a completed job returns its stored result unchanged.
+	if _, err := s.Engine.RunGCJob(id, false); err != nil {
+		if errors.Is(err, repo.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "gc job does not exist", nil)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "gc_failed", err.Error(), map[string]any{"job_id": id})
+		return
+	}
+	s.writeJob(w, r, http.StatusOK, id)
+}
+
+// writeJob renders a job with its frozen targets and chunk-sweep progress.
+func (s *Server) writeJob(w http.ResponseWriter, r *http.Request, status int, jobID int64) {
+	job, err := s.Engine.Manifest.GetGCJob(jobID)
+	if errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "gc job does not exist", nil)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	targets, err := s.Engine.Manifest.GCJobTargets(jobID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	stats, err := s.Engine.Manifest.GCJobChunkStats(jobID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	writeJSON(w, status, gcJobJSON(*job, targets, stats))
+}
+
+func gcJobJSON(j repo.GCJob, targets []repo.GCJobTarget, chunkStats map[string]int) map[string]any {
+	out := map[string]any{
+		"id":              j.ID,
+		"status":          j.Status,
+		"rule":            json.RawMessage(j.RuleParams),
+		"snapshots_total": j.SnapshotsTotal,
+		"snapshots_done":  j.SnapshotsDone,
+		"refs_deleted":    j.RefsDeleted,
+		"blobs_deleted":   j.BlobsDeleted,
+		"bytes_freed":     j.BytesFreed,
+		"created_at":      j.CreatedAt,
+		"updated_at":      j.UpdatedAt,
+	}
+	if j.FinishedAt != nil {
+		out["finished_at"] = j.FinishedAt
+	}
+	if j.Error != "" {
+		out["error"] = j.Error
+	}
+	if targets != nil {
+		ts := make([]map[string]any, 0, len(targets))
+		for _, t := range targets {
+			ts = append(ts, map[string]any{
+				"snapshot_id": t.SnapshotID, "status": t.Status,
+				"root_path": t.RootPath, "bytes_total": t.BytesTotal,
+				"committed_at": t.CommittedAt,
+			})
+		}
+		out["targets"] = ts
+	}
+	if chunkStats != nil {
+		out["chunks"] = chunkStats
+	}
+	return out
+}
+
+func (s *Server) gcEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.Engine.Manifest.GetGCJob(id); errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "gc job does not exist", nil)
+		return
+	}
+	events, err := s.Engine.Manifest.ListGCEvents(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]map[string]any, 0, len(events))
+	for _, e := range events {
+		item := map[string]any{
+			"id":         e.ID,
+			"action":     e.Action,
+			"detail":     e.Detail,
+			"created_at": e.CreatedAt,
+		}
+		if e.SnapshotID != nil {
+			item["snapshot_id"] = *e.SnapshotID
+		}
+		if len(e.ChunkDigest) > 0 {
+			item["chunk_digest"] = hex.EncodeToString(e.ChunkDigest)
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job_id": id, "events": out})
 }

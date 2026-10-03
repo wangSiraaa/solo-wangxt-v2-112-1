@@ -120,6 +120,79 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Retention rules are versioned and immutable: every update inserts a new
+-- version row, so a GC job can freeze the exact rule version it ran with.
+CREATE TABLE IF NOT EXISTS retention_rules (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	name       TEXT    NOT NULL,
+	version    INTEGER NOT NULL,
+	keep_last  INTEGER NOT NULL,
+	keep_days  INTEGER NOT NULL,
+	created_at TEXT    NOT NULL,
+	UNIQUE(name, version)
+);
+
+-- Protect flags: a protected snapshot is never a GC target.
+CREATE TABLE IF NOT EXISTS snapshot_protections (
+	snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+	reason      TEXT NOT NULL DEFAULT '',
+	created_at  TEXT NOT NULL
+);
+
+-- GC jobs. Status machine: planned -> refs_deleted -> completed | failed.
+-- The rule version and the full target/chunk sets are frozen at creation,
+-- before anything is deleted, so an interrupted job resumes deterministically.
+CREATE TABLE IF NOT EXISTS gc_jobs (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	status          TEXT NOT NULL,
+	rule_name       TEXT NOT NULL DEFAULT '',
+	rule_version    INTEGER NOT NULL DEFAULT 0,
+	rule_params     TEXT NOT NULL DEFAULT '{}', -- frozen JSON copy of the rule
+	snapshots_total INTEGER NOT NULL DEFAULT 0,
+	snapshots_done  INTEGER NOT NULL DEFAULT 0,
+	refs_deleted    INTEGER NOT NULL DEFAULT 0,
+	blobs_deleted   INTEGER NOT NULL DEFAULT 0,
+	bytes_freed     INTEGER NOT NULL DEFAULT 0,
+	error           TEXT NOT NULL DEFAULT '',
+	created_at      TEXT NOT NULL,
+	updated_at      TEXT NOT NULL,
+	finished_at     TEXT
+);
+
+-- Frozen per-job target set. status: pending | refs_deleted | skipped_protected.
+CREATE TABLE IF NOT EXISTS gc_job_targets (
+	job_id       INTEGER NOT NULL REFERENCES gc_jobs(id) ON DELETE CASCADE,
+	snapshot_id  INTEGER NOT NULL,
+	status       TEXT    NOT NULL DEFAULT 'pending',
+	root_path    TEXT    NOT NULL DEFAULT '',
+	bytes_total  INTEGER NOT NULL DEFAULT 0,
+	committed_at TEXT    NOT NULL DEFAULT '',
+	PRIMARY KEY (job_id, snapshot_id)
+);
+
+-- Frozen per-job candidate blob set (chunks the targets referenced at freeze
+-- time). A blob is only deleted after re-confirming zero entry_chunks rows
+-- still reference it. status: pending | deleted | kept.
+CREATE TABLE IF NOT EXISTS gc_job_chunks (
+	job_id INTEGER NOT NULL REFERENCES gc_jobs(id) ON DELETE CASCADE,
+	digest BLOB    NOT NULL,
+	length INTEGER NOT NULL,
+	status TEXT    NOT NULL DEFAULT 'pending',
+	PRIMARY KEY (job_id, digest)
+);
+
+-- Append-only audit trail of everything a GC job did.
+CREATE TABLE IF NOT EXISTS gc_events (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id       INTEGER NOT NULL REFERENCES gc_jobs(id) ON DELETE CASCADE,
+	snapshot_id  INTEGER,
+	chunk_digest BLOB,
+	action       TEXT NOT NULL,
+	detail       TEXT NOT NULL DEFAULT '',
+	created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gc_events_job ON gc_events(job_id, id);
 `
 
 func (m *Manifest) migrate() error {
