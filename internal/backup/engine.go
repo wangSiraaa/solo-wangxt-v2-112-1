@@ -38,7 +38,8 @@ type Engine struct {
 	Pol      chunker.Pol
 	Fail     Failpoints
 
-	mu sync.Mutex // serializes snapshots: scan + commit is one critical section
+	mu   sync.Mutex  // serializes snapshots: scan + commit is one critical section
+	gcMu *sync.Mutex // serializes GC jobs against each other
 }
 
 // NewEngine opens an engine, loading the repository's chunking polynomial
@@ -262,6 +263,10 @@ func (e *Engine) RecoverPending() ([]CreateSnapshotResult, error) {
 // restore never overwrites.
 var ErrTargetExists = errors.New("restore destination already exists")
 
+// ErrSnapshotReclaimed is returned when restore is asked for a snapshot whose
+// references were garbage-collected; only the audit tombstone remains.
+var ErrSnapshotReclaimed = errors.New("snapshot has been garbage-collected")
+
 // RestoreResult is the manifest-to-disk verification report of a restore.
 type RestoreResult struct {
 	SnapshotID int64
@@ -295,6 +300,10 @@ func (e *Engine) Restore(snapshotID int64, target string) (*RestoreResult, error
 		return nil, err
 	}
 	if info.Status != repo.StatusCommitted {
+		if info.Status == repo.StatusReclaimed {
+			return nil, fmt.Errorf("%w: snapshot %d is a reclaimed tombstone",
+				ErrSnapshotReclaimed, snapshotID)
+		}
 		return nil, fmt.Errorf("snapshot %d is %s, only committed snapshots can be restored",
 			snapshotID, info.Status)
 	}

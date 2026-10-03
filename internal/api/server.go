@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,12 @@ import (
 	"incbackup/internal/backup"
 	"incbackup/internal/repo"
 )
+
+func decodeJSON(r *http.Request, v any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
 
 // Server wires the engine to HTTP.
 type Server struct {
@@ -31,6 +38,19 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("PUT /v1/snapshots/{id}/hold", s.addHold)
+	mux.HandleFunc("DELETE /v1/snapshots/{id}/hold", s.releaseHold)
+	mux.HandleFunc("GET /v1/snapshots/{id}/holds", s.listHolds)
+
+	mux.HandleFunc("POST /v1/retention/rules", s.createRule)
+	mux.HandleFunc("GET /v1/retention/rules/latest", s.latestRule)
+	mux.HandleFunc("GET /v1/retention/preview", s.previewRetention)
+	mux.HandleFunc("POST /v1/retention/gc", s.runGC)
+	mux.HandleFunc("GET /v1/retention/gc", s.listGC)
+	mux.HandleFunc("GET /v1/retention/gc/{gid}", s.getGC)
+	mux.HandleFunc("POST /v1/retention/gc/{gid}/resume", s.resumeGC)
+	mux.HandleFunc("GET /v1/retention/gc/{gid}/audit", s.jobAudit)
+	mux.HandleFunc("GET /v1/retention/audit", s.allAudit)
 	return mux
 }
 
@@ -64,6 +84,7 @@ type snapshotResp struct {
 	ChunksNew   int64      `json:"chunks_new"`
 	ChunksRef   int64      `json:"chunks_referenced"`
 	Polynomial  string     `json:"polynomial"`
+	Held        bool       `json:"held"`
 	CreatedAt   time.Time  `json:"created_at"`
 	CommittedAt *time.Time `json:"committed_at,omitempty"`
 	Message     string     `json:"message"`
@@ -93,8 +114,15 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]snapshotResp, 0, len(all))
+	held, err := s.Engine.Manifest.HeldSnapshotIDs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
 	for _, si := range all {
-		out = append(out, toSnapshotResp(si))
+		r := toSnapshotResp(si)
+		r.Held = held[si.ID]
+		out = append(out, r)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
 }
@@ -182,7 +210,11 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, toSnapshotResp(si))
+	resp := toSnapshotResp(si)
+	if holds, err := s.Engine.Manifest.HoldsOf(id); err == nil {
+		resp.Held = len(holds) > 0
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +344,10 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, backup.ErrTargetExists) {
 			writeErr(w, http.StatusConflict, "target_exists", err.Error(), nil)
+			return
+		}
+		if errors.Is(err, backup.ErrSnapshotReclaimed) {
+			writeErr(w, http.StatusGone, "snapshot_reclaimed", err.Error(), nil)
 			return
 		}
 		if strings.Contains(err.Error(), "only committed snapshots") {

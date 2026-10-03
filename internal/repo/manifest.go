@@ -17,6 +17,7 @@ const (
 	StatusPending   = "pending"   // scan done, not yet verified/finalized
 	StatusCommitted = "committed" // all chunks verified live, usable for restore
 	StatusFailed    = "failed"    // verification or commit failed; see snapshot_errors
+	StatusReclaimed = "reclaimed" // committed snapshot whose references GC deleted; tombstone row kept for audit
 )
 
 // Manifest is the SQLite-backed backup catalog.
@@ -120,6 +121,83 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Retention rules are versioned and immutable: every garbage-collection job
+-- freezes the exact version it ran against, so the reason a snapshot was a
+-- reclamation target stays auditable forever. Only the highest version is
+-- active; the older rows are history, never edited in place.
+CREATE TABLE IF NOT EXISTS retention_rules (
+	version     INTEGER PRIMARY KEY AUTOINCREMENT,
+	keep_last_n INTEGER NOT NULL DEFAULT 0, -- keep N newest eligible snapshots; 0 = disabled
+	max_age_days INTEGER NOT NULL DEFAULT 0, -- keep snapshots younger than N days; 0 = disabled
+	created_at  TEXT    NOT NULL,
+	note        TEXT    NOT NULL DEFAULT ''
+);
+
+-- A legal/hold ("保全") pin on one snapshot. GC never selects a held snapshot
+-- as a target; pending/failed snapshots are never eligible regardless. The
+-- row is deleted on release; gc_audit keeps the history of who held what.
+CREATE TABLE IF NOT EXISTS snapshot_holds (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+	reason      TEXT    NOT NULL DEFAULT '',
+	created_at  TEXT    NOT NULL,
+	released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_holds_snap ON snapshot_holds(snapshot_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_active
+	ON snapshot_holds(snapshot_id) WHERE released_at IS NULL;
+
+-- Garbage-collection jobs. A job freezes both its target set and the rule
+-- version up front (rule_version/target snapshot is fixed), then runs a
+-- resumable two-phase deletion. Re-posting a finished job never re-executes it.
+CREATE TABLE IF NOT EXISTS gc_jobs (
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	rule_version      INTEGER NOT NULL REFERENCES retention_rules(version),
+	status            TEXT    NOT NULL,        -- queued | running | succeeded | failed
+	frozen_at         TEXT    NOT NULL,
+	started_at        TEXT,
+	finished_at       TEXT,
+	error             TEXT    NOT NULL DEFAULT '',
+	target_count      INTEGER NOT NULL DEFAULT 0,
+	blob_count        INTEGER NOT NULL DEFAULT 0,
+	blobs_deleted     INTEGER NOT NULL DEFAULT 0,
+	blobs_kept_shared INTEGER NOT NULL DEFAULT 0,
+	bytes_freed       INTEGER NOT NULL DEFAULT 0
+);
+
+-- Frozen per-snapshot target of a job. state is advanced in place so a
+-- restarted job resumes exactly where it stopped.
+CREATE TABLE IF NOT EXISTS gc_job_targets (
+	job_id       INTEGER NOT NULL REFERENCES gc_jobs(id) ON DELETE CASCADE,
+	snapshot_id  INTEGER NOT NULL,
+	state        TEXT    NOT NULL, -- pending | done | skipped_held
+	reason       TEXT    NOT NULL DEFAULT '',
+	committed_at TEXT    NOT NULL,
+	PRIMARY KEY (job_id, snapshot_id)
+);
+
+-- Frozen blob candidate of a job. No FK to chunks on purpose: phase two
+-- deletes the chunks row itself; the digest+length copy here is the work list.
+CREATE TABLE IF NOT EXISTS gc_job_blobs (
+	job_id   INTEGER NOT NULL REFERENCES gc_jobs(id) ON DELETE CASCADE,
+	digest   BLOB    NOT NULL,
+	length   INTEGER NOT NULL,
+	state    TEXT    NOT NULL, -- pending | row_removed | deleted | kept_shared
+	PRIMARY KEY (job_id, digest)
+);
+
+-- Append-only audit trail for retention/hold/GC operations.
+CREATE TABLE IF NOT EXISTS gc_audit (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id      INTEGER,
+	event       TEXT    NOT NULL,
+	snapshot_id INTEGER,
+	digest      BLOB,
+	detail      TEXT    NOT NULL DEFAULT '',
+	created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gc_audit_job ON gc_audit(job_id, id);
 `
 
 func (m *Manifest) migrate() error {

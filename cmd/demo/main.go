@@ -274,6 +274,211 @@ func main() {
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
 
+	// =======================================================================
+	// 本地保留与回收（retention / hold / 两阶段 GC）
+	// 使用完全独立的仓库与服务，使保留规则只作用于本章节的快照集。
+	gcRepoDir := filepath.Join(work, "gc-repo")
+	gsrv := startServer(gcRepoDir)
+	gcsrc := filepath.Join(work, "gcsrc")
+	must(os.MkdirAll(gcsrc, 0o755))
+	glog := make([]byte, 0, 160*1024)
+	for i := 0; i < 160*1024; i++ {
+		glog = append(glog, byte("abcdefghijklmnopqrstuvwxyz0123456789\n"[i%37]))
+	}
+	must(os.WriteFile(filepath.Join(gcsrc, "g.log"), glog, 0o644))
+	gs1 := int64(post(gsrv.URL+"/v1/snapshots", map[string]any{"root": gcsrc, "message": "gc base"})["snapshot_id"].(float64))
+
+	// ---- 8. retention rules + hold: preview/execution skip held -----------
+	section(8, "保留规则与保全标记：规则版本化入库；被保全快照在预览与执行时都跳过")
+	code, body = raw("POST", gsrv.URL+"/v1/retention/rules",
+		map[string]any{"keep_last_n": 0, "max_age_days": 0})
+	check("keep_last_n 与 max_age_days 同时为 0 的规则被拒绝（防止清空一切）",
+		code == http.StatusBadRequest)
+
+	// 中部小改产生 gs2：仅 1 个新块，其余块与 gs1 共享。
+	copy(glog[80*1024:80*1024+8], []byte("PATCHED!"))
+	must(os.WriteFile(filepath.Join(gcsrc, "g.log"), glog, 0o644))
+	gs2 := int64(post(gsrv.URL+"/v1/snapshots", map[string]any{"root": gcsrc, "message": "gc patched"})["snapshot_id"].(float64))
+
+	rule := post(gsrv.URL+"/v1/retention/rules", map[string]any{"keep_last_n": 1, "note": "keep newest one"})
+	ruleV := int64(rule["version"].(float64))
+	fmt.Printf("  规则 v%d: keep_last_n=%v\n", ruleV, rule["keep_last_n"])
+	pv := get(gsrv.URL + "/v1/retention/preview")
+	cands := arr(pv, "candidates")
+	check("回收预览精确选中较旧快照 gs1（gs2 受 keep_last_n 保护）",
+		len(cands) == 1 && int64(cands[0].(map[string]any)["snapshot_id"].(float64)) == gs1)
+	excl := arr(pv, "exclusive_blobs")
+	fmt.Printf("  预览: 候选=%d 可释放块=%d 可释放字节=%v 被保全跳过=%d\n",
+		len(cands), len(excl), pv["exclusive_bytes"], len(arr(pv, "skipped_held_snapshots")))
+	check("预览只把 gs1 独占块计入可释放（共享块不在清单里）", len(excl) == 1)
+
+	code, body = raw("PUT", fmt.Sprintf("%s/v1/snapshots/%d/hold", gsrv.URL, gs1),
+		map[string]any{"reason": "legal hold 2026-Q4"})
+	check("对 gs1 加保全成功 (201)", code == http.StatusCreated)
+	code, _ = raw("PUT", fmt.Sprintf("%s/v1/snapshots/%d/hold", gsrv.URL, gs1), nil)
+	check("重复保全被拒绝 (409)", code == http.StatusConflict)
+	pv = get(gsrv.URL + "/v1/retention/preview")
+	check("加保全后预览无候选、gs1 出现在 skipped_held",
+		len(arr(pv, "candidates")) == 0 &&
+			len(arr(pv, "skipped_held_snapshots")) == 1)
+	g1info := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", gs1))
+	check("快照查询回显 held=true", g1info["held"] == true)
+	body = post(gsrv.URL+"/v1/retention/gc", nil)
+	check("保全存在时执行回收：目标数 0，什么都不删",
+		int64(body["target_count"].(float64)) == 0)
+
+	// ---- 9. acceptance ①: reclaim older, shared blobs survive -------------
+	section(9, "解除保全后回收较旧快照：共享 blob 全部保留，较新快照可完整恢复")
+	code, _ = raw("DELETE", fmt.Sprintf("%s/v1/snapshots/%d/hold", gsrv.URL, gs1), nil)
+	check("解除保全成功", code == http.StatusOK)
+	body = post(gsrv.URL+"/v1/retention/gc", nil)
+	job1 := int64(body["job_id"].(float64))
+	fmt.Printf("  作业 %d: status=%v targets_done=%v blobs_deleted=%v kept_shared=%v bytes_freed=%v\n",
+		job1, body["status"], body["targets_done"], body["blobs_deleted"],
+		body["blobs_kept_shared"], body["bytes_freed"])
+	check("回收作业成功、冻结规则版本为最新版本",
+		body["status"] == "succeeded" && int64(body["rule_version"].(float64)) == ruleV)
+	check("只冻结并删除 gs1 的 1 个独占块；共享块从不进入候选清单（blob_count=1）",
+		body["blob_count"].(float64) == 1 &&
+			body["blobs_deleted"].(float64) == 1)
+
+	g1info = get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", gs1))
+	check("gs1 成为 reclaimed 墓碑快照", g1info["status"] == "reclaimed")
+	code, _ = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", gsrv.URL, gs1),
+		map[string]any{"target": filepath.Join(work, "gs1-restore-attempt")})
+	check("reclaimed 快照不可再恢复", code >= 400)
+	gc2dir := filepath.Join(work, "gs2-restore")
+	code, body = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", gsrv.URL, gs2),
+		map[string]any{"target": gc2dir})
+	check("较新快照 gs2 恢复成功（共享块仍在）", code == http.StatusCreated)
+	gh, _ := os.ReadFile(filepath.Join(gc2dir, "g.log"))
+	check("恢复内容与源逐字节一致——共享 blob 一个都没被删", bytes.Equal(gh, glog))
+
+	body = post(gsrv.URL+"/v1/retention/gc", nil)
+	check("再次执行不会重跑旧作业：冻结出全新的空作业",
+		int64(body["job_id"].(float64)) != job1 &&
+			int64(body["target_count"].(float64)) == 0 &&
+			int64(body["blobs_deleted"].(float64)) == 0)
+
+	// ---- 10. acceptance ③: crash between refs-delete and blob-cleanup -----
+	section(10, "两阶段可恢复：引用已删、blob 未清时中断；重启续跑同一作业且结果一致")
+	// 用一段不同的中部改动生成 gs3：gs2 的独有块（PATCHED! 位置）不被 gs3 引用，
+	// 因而在冻结集里成为“待清理的无引用块”；其余块二者共享必须保留。
+	for i := 0; i < len(glog); i++ {
+		glog[i] = byte("abcdefghijklmnopqrstuvwxyz0123456789\n"[i%37])
+	}
+	copy(glog[120*1024:120*1024+12], []byte("REWRITTEN!!=="))
+	must(os.WriteFile(filepath.Join(gcsrc, "g.log"), glog, 0o644))
+	gs3 := int64(post(gsrv.URL+"/v1/snapshots", map[string]any{"root": gcsrc, "message": "gc tail"})["snapshot_id"].(float64))
+	future := time.Now().UTC().Add(31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	code, body = raw("POST",
+		gsrv.URL+"/v1/retention/gc?crash_after_phase1=1&now="+future, nil)
+	fmt.Printf("  注入中断 -> HTTP %d 作业 %v status=%v\n", code, body["job_id"], body["status"])
+	check("中断返回 202，作业持久化为 failed（可续跑）",
+		code == http.StatusAccepted && body["status"] == "failed")
+	job2 := int64(body["job_id"].(float64))
+	check("阶段一已完成：gs2 引用删除但 0 个 blob 被清理",
+		body["targets_done"].(float64) == 1 && body["blobs_deleted"].(float64) == 0)
+	g2info := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", gs2))
+	check("中断态：gs2 已 reclaimed", g2info["status"] == "reclaimed")
+	// gs3 在中断期间仍可完整恢复：blob 一个都还没删。
+	midDir := filepath.Join(work, "gs3-midcrash")
+	code, _ = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", gsrv.URL, gs3),
+		map[string]any{"target": midDir})
+	check("中断窗口内较新快照 gs3 依然可恢复", code == http.StatusCreated)
+
+	// “重启服务”后续跑同一作业 id。
+	gsrv.Close()
+	gsrv = startServer(gcRepoDir)
+	time.Sleep(100 * time.Millisecond)
+	body = post(gsrv.URL+fmt.Sprintf("/v1/retention/gc/%d/resume", job2), nil)
+	fmt.Printf("  续跑作业 %d: status=%v deleted=%v kept=%v\n",
+		job2, body["status"], body["blobs_deleted"], body["blobs_kept_shared"])
+	check("续跑使用同一作业 id 且成功",
+		int64(body["job_id"].(float64)) == job2 && body["status"] == "succeeded" &&
+			body["resumed"] == true)
+	check("续跑只清理无引用块（gs2 独占块 1 个），共享块计数一致",
+		body["blobs_deleted"].(float64) == 1)
+	g3dir := filepath.Join(work, "gs3-after-resume")
+	code, _ = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", gsrv.URL, gs3),
+		map[string]any{"target": g3dir})
+	check("续跑后 gs3 仍可完整恢复", code == http.StatusCreated)
+	gh, _ = os.ReadFile(filepath.Join(g3dir, "g.log"))
+	check("续跑后恢复内容仍与源一致", bytes.Equal(gh, glog))
+	body = post(gsrv.URL+fmt.Sprintf("/v1/retention/gc/%d/resume", job2), nil)
+	check("已完成作业不可重新执行：返回同一记账结果",
+		body["already_done"] == true && body["blobs_deleted"].(float64) == 1)
+
+	// ---- 11. acceptance ④: pending/failed + diagnostics never reclaimed ----
+	section(11, "并发安全与诊断保全：pending/failed 快照不被回收，/errors、/missing 永远可查")
+	// failed 快照用独立目录，保证其丢失块诊断不会被后续扫描“自愈”。
+	fsrc := filepath.Join(work, "fail-src")
+	must(os.MkdirAll(fsrc, 0o755))
+	must(os.WriteFile(filepath.Join(fsrc, "uniq.log"),
+		[]byte(strings.Repeat("zzzz-unique-failure-content\n", 600)), 0o644))
+	code, body = raw("POST", gsrv.URL+"/v1/snapshots",
+		map[string]any{"root": fsrc, "message": "gc-era failed", "lose_chunks": 1})
+	check("故障快照仍按原机制失败", code == http.StatusConflict)
+	fID := int64(body["snapshot_id"].(float64))
+	fmiss := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d/missing", fID))["missing"].([]any)
+	ferrs := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d/errors", fID))["errors"].([]any)
+	check("失败快照 /missing 与 /errors 诊断存在", len(fmiss) == 1 && len(ferrs) > 0)
+
+	// pending 快照：与 gs3 内容一致，其引用块必须保护 gs3 的旧引用。
+	pbody := post(gsrv.URL+"/v1/snapshots", map[string]any{"root": gcsrc, "message": "gc-era pending", "finish": false})
+	pID := int64(pbody["snapshot_id"].(float64))
+	check("制造 pending 快照", pbody["status"] == "pending")
+	// 再提交一个更新的 gs4，使 gs3 成为“较旧的已提交”候选。
+	glog = append(glog, []byte("EVEN NEWER G4 TAIL\n")...)
+	must(os.WriteFile(filepath.Join(gcsrc, "g.log"), glog, 0o644))
+	gs4 := int64(post(gsrv.URL+"/v1/snapshots", map[string]any{"root": gcsrc, "message": "gs4 newest"})["snapshot_id"].(float64))
+
+	body = post(gsrv.URL+"/v1/retention/gc?now="+future, nil)
+	fmt.Printf("  回收作业: targets_done=%v blob_count=%v blobs_deleted=%v\n",
+		body["targets_done"], body["blob_count"], body["blobs_deleted"])
+	check("仅 gs3 作为已提交旧快照被回收（pending/failed 不入选）",
+		body["status"] == "succeeded" && body["targets_done"].(float64) == 1)
+	check("gs3 的块仍被 pending 快照引用：冻结候选块为 0、删除 0",
+		body["blob_count"].(float64) == 0 && body["blobs_deleted"].(float64) == 0)
+	fInfo := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", fID))
+	pInfo := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", pID))
+	g4info := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d", gs4))
+	check("failed / pending 快照状态原样保留",
+		fInfo["status"] == "failed" && pInfo["status"] == "pending" &&
+			g4info["status"] == "committed")
+	fmiss2 := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d/missing", fID))["missing"].([]any)
+	ferrs2 := get(gsrv.URL + fmt.Sprintf("/v1/snapshots/%d/errors", fID))["errors"].([]any)
+	check("GC 之后 /missing、/errors 诊断条数不变",
+		len(fmiss2) == len(fmiss) && len(ferrs2) == len(ferrs))
+
+	// 启动恢复对 pending 给出结论，且其块因受保护仍在，可完整恢复。
+	rec := post(gsrv.URL+"/v1/recover", nil)["recovered"].([]any)
+	ok := false
+	for _, x := range rec {
+		m := x.(map[string]any)
+		if int64(m["snapshot_id"].(float64)) == pID && m["status"] == "committed" {
+			ok = true
+		}
+	}
+	check("/v1/recover 把 pending 快照复验为 committed", ok)
+	pdir := filepath.Join(work, "p-restore")
+	code, _ = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", gsrv.URL, pID),
+		map[string]any{"target": pdir})
+	check("被 pending 保全的内容块支撑其恢复成功", code == http.StatusCreated)
+
+	// 全局审计可查。
+	allEvents := get(gsrv.URL + "/v1/retention/audit")["events"].([]any)
+	eventKinds := map[string]bool{}
+	for _, x := range allEvents {
+		eventKinds[x.(map[string]any)["event"].(string)] = true
+	}
+	check("全局审计包含规则、保全、回收各阶段事件（含中断与续跑）",
+		eventKinds["retention_rule_created"] && eventKinds["hold_added"] &&
+			eventKinds["hold_released"] && eventKinds["target_reclaimed"] &&
+			eventKinds["blob_deleted"] && eventKinds["job_interrupted"] &&
+			eventKinds["job_succeeded"])
+	gsrv.Close()
+
 	// final listing
 	section(0, "快照总览")
 	list := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
@@ -356,6 +561,13 @@ func raw(method, url string, body any) (int, map[string]any) {
 		out = map[string]any{}
 	}
 	return resp.StatusCode, out
+}
+
+func arr(m map[string]any, key string) []any {
+	if v, ok := m[key].([]any); ok {
+		return v
+	}
+	return nil
 }
 
 func hashFile(p string) (string, int64) {

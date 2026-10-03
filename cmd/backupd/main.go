@@ -56,6 +56,22 @@ func main() {
 		}
 	}
 
+	// A GC job interrupted (crash/power loss) sits queued/running/failed with
+	// its frozen plan intact. Resume it in place on startup: phase 2 only
+	// removes blobs still unreferenced, so this can never delete a shared
+	// chunk a snapshot taken while we were down depends on.
+	if active, err := manifest.ActiveGCJob(); err != nil {
+		log.Printf("startup gc inspect: %v", err)
+	} else if active != nil {
+		res, err := engine.ResumeGC(active.ID)
+		if err != nil {
+			log.Printf("startup gc resume job %d: %v", active.ID, err)
+		} else {
+			log.Printf("startup gc resume: job %d -> %s (deleted=%d kept_shared=%d bytes_freed=%d)",
+				res.JobID, res.Status, res.BlobsDeleted, res.BlobsKept, res.BytesFreed)
+		}
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)
